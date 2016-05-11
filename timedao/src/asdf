@@ -1,0 +1,277 @@
+/*
+package main
+
+import (
+	"fmt"
+	ss "goserv/server"
+)
+
+func main() {
+	s := ss.NewServer() // r := &router{make(map[string]map[string]HandlerFunc)}
+
+	s.HandleFunc("GET", "/", func(c *ss.Context) {
+		fmt.Fprintln(c.res_w, "Welcome !")
+	})
+	s.HandleFunc("GET", "/about", func(c *Context) {
+		fmt.Fprintln(c.res_w, "This is ABOUT page !")
+	})
+	s.HandleFunc("GET", "/public/index.html",
+		Loghandler(Recoverhandler(StaticHandler(func(c *Context) {}))))
+	s.HandleFunc("GET", "/users/:id", Loghandler(Recoverhandler(func(c *Context) {
+		if c.para["id"] == "0" {
+			panic("id is zero")
+		}
+		fmt.Fprintf(c.res_w, "Retrieve User id : %v\n", c.para["id"])
+	})))
+
+	s.HandleFunc("POST", "/", func(c *Context) {
+		fmt.Fprintln(c.res_w, "Create User Page !")
+	})
+
+	s.HandleFunc("GET", "/users/:user_id/addr/:addr_id", Loghandler(func(c *Context) {
+		fmt.Fprintf(c.res_w, "Retrieve User id : %v, Address id : %v\n",
+			c.para["user_id"],
+			c.para["addr_id"])
+	}))
+
+	s.HandleFunc("POST", "/users/:user_id/addr/", Loghandler(func(c *Context) {
+		fmt.Fprintf(c.res_w, "Retrieve User id : %v\n", c.para["user_id"])
+	}))
+
+	s.Run("8080") // http.ListenAndServe(":8080", r)
+}
+*/
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+)
+
+type router struct {
+	handlers map[string]map[string]HandlerFunc
+}
+
+type Handler interface {
+	ServeHTTP(http.ResponseWriter, *http.Request)
+}
+
+type HandlerFunc func(*Context)
+type Middleware func(next HandlerFunc) HandlerFunc
+
+type Context struct {
+	para  map[string]interface{}
+	res_w http.ResponseWriter
+	req   *http.Request
+}
+
+type Server struct {
+	*router
+	middlewares  []Middleware
+	startHandler HandlerFunc
+}
+
+func NewServer() *Server {
+	r := &router{make(map[string]map[string]HandlerFunc)}
+	s := &Server{router: r}
+	s.middlewares = []Middleware{
+		loghandler,
+		recoverhandler,
+		staticHandler,
+	}
+	return s
+}
+
+func (s *Server) Run(addr string) {
+	s.startHandler = s.router.handler()
+
+	for i := len(s.middlewares); i >= 0; i-- {
+		s.startHandler = s.middlewares[i](s.startHandler)
+	}
+
+	if err := http.ListenAndServe(":"+addr, s); err != nil {
+		panic(err)
+	}
+}
+
+func loghandler(next HandlerFunc) HandlerFunc {
+	return func(c *Context) {
+		t := time.Now()
+		next(c)
+
+		log.Printf("[%s] %q %v\n",
+			c.req.Method,
+			c.req.URL.String(),
+			time.Now().Sub(t))
+	}
+}
+
+func recoverhandler(next HandlerFunc) HandlerFunc {
+	return func(c *Context) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("Panic : %+v", err)
+				http.Error(
+					c.res_w,
+					http.StatusText(http.StatusInternalServerError),
+					http.StatusInternalServerError)
+			}
+		}()
+		next(c)
+	}
+}
+
+func staticHandler(next HandlerFunc) HandlerFunc {
+	var (
+		dir       = http.Dir(".")
+		indexFile = "index.html"
+	)
+	return func(c *Context) {
+		if c.req.Method != "GET" && c.req.Method != "HEAD" {
+			next(c)
+			return
+		}
+
+		file := c.req.URL.Path
+		f, err := dir.Open(file)
+		if err != nil {
+			next(c)
+			return
+		}
+		defer f.Close()
+
+		ff, err := f.Stat()
+		if err != nil {
+			next(c)
+			return
+		}
+
+		if ff.IsDir() {
+			if !strings.HasSuffix(c.req.URL.Path, "/") {
+				http.Redirect(c.res_w, c.req, c.req.URL.Path+"/", http.StatusFound)
+				return
+			}
+
+			file = path.Join(file, indexFile)
+			f, err = dir.Open(file)
+			if err != nil {
+				next(c)
+				return
+			}
+			defer f.Close()
+
+			ff, err := f.Stat()
+			if err != nil || ff.IsDir() {
+				next(c)
+				return
+			}
+		}
+
+		http.ServeContent(c.res_w, c.req, file, ff.ModTime(), f)
+	}
+}
+
+func match(pattern, path string) (bool, map[string]string) {
+	if pattern == path {
+		return true, nil
+	}
+
+	patterns := strings.Split(pattern, "/")
+	paths := strings.Split(path, "/")
+
+	if len(patterns) != len(paths) {
+		return false, nil
+	}
+
+	params := make(map[string]string)
+
+	for i := 0; i < len(patterns); i++ {
+		switch {
+		case patterns[i] == paths[i]:
+		case len(patterns[i]) > 0 && patterns[i][0] == ':':
+			params[patterns[i][1:]] = paths[i]
+		default:
+			return false, nil
+		}
+	}
+	return true, params
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c := &Context{
+		para:  make(map[string]interface{}),
+		res_w: w,
+		req:   r,
+	}
+	for method, data := range r.URL.Query() {
+		c.para[method] = data[0]
+	}
+	s.startHandler(c)
+}
+
+func (r *router) HandleFunc(method, pattern string, h HandlerFunc) {
+	m, ok := r.handlers[method] // method : GET, POST, PUT, DELETE
+	if !ok {
+		m = make(map[string]HandlerFunc)
+		r.handlers[method] = m
+	}
+	m[pattern] = h
+}
+
+func (r *router) handler() HandlerFunc {
+	return func(c *Context) {
+		for pattern, handler := range r.handlers[c.req.Method] {
+			if ok, params := match(pattern, c.req.URL.Path); ok {
+				for method, data := range params {
+					c.para[method] = data
+				}
+
+				handler(c)
+				return
+			}
+		}
+
+		http.NotFound(c.res_w, c.req)
+		return
+	}
+}
+
+func main() {
+	s := NewServer() //r := &router{make(map[string]map[string]HandlerFunc)}
+
+	s.HandleFunc("GET", "/", func(c *Context) {
+		fmt.Fprintln(c.res_w, "Welcome !")
+	})
+	s.HandleFunc("GET", "/about", func(c *Context) {
+		fmt.Fprintln(c.res_w, "This is ABOUT Page !")
+	})
+
+	s.HandleFunc("GET", "/public/index.html",
+		loghandler(recoverhandler(staticHandler(func(c *Context) {}))))
+	s.HandleFunc("GET", "/users/:id", loghandler(recoverhandler(func(c *Context) {
+		if c.para["id"] == "0" {
+			panic("id is zero")
+		}
+		fmt.Fprintf(c.res_w, "Retrieve User id : %v\n", c.para["id"])
+	})))
+
+	s.HandleFunc("POST", "/users", func(c *Context) {
+		fmt.Fprintln(c.res_w, "Create User Page !")
+	})
+
+	s.HandleFunc("GET", "/users/:user_id/addr/:addr_id", loghandler(func(c *Context) {
+		fmt.Fprintf(c.res_w, "Retrieve User id : %v, Address id : %v\n",
+			c.para["user_id"],
+			c.para["addr_id"])
+	}))
+
+	s.HandleFunc("POST", "/users/:user_id/addr/", loghandler(func(c *Context) {
+		fmt.Fprintf(c.res_w, "Retrieve User id : %v\n", c.para["user_id"])
+	}))
+
+	s.Run(":8080") // http.ListenAndServe(":8080", r)
+}

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://C://GoServer/GoServer.iml" filepath="C://GoServer/GoServer.iml" />
+      <module fileurl="file://$PROJECT_DIR$/GoServer.iml" filepath="$PROJECT_DIR$/GoServer.iml" />
     </modules>
   </component>
 </project>
